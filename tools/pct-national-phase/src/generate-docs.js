@@ -18,12 +18,22 @@ function loadTemplate(kind, countryCode) {
   }
   const content = fs.readFileSync(file, "binary");
   const zip = new PizZip(content);
-  return new Docxtemplater(zip, { paragraphLoop: true, linebreaks: true });
+  // nullGetter: 템플릿에 있는 토큰인데 데이터에 없는 경우(예: 발명자 수가 템플릿 슬롯보다 적음)
+  // 에러를 던지지 않고 빈 문자열로 채운다.
+  return new Docxtemplater(zip, { paragraphLoop: true, linebreaks: true, nullGetter: () => "" });
 }
 
 function renderToBuffer(doc, data) {
   doc.render(data);
   return doc.getZip().generate({ type: "nodebuffer" });
+}
+
+// 사무소 관리번호 규칙이 두 가지라 (하이픈 유무 등), countries.<코드>.ourRef로 명시적으로
+// 지정하면 그 값을 그대로 쓰고, 없으면 기본 규칙(refBase-국가코드)을 적용한다.
+function resolveOurRef(caseData, countryCode) {
+  const c = caseData.countries[countryCode];
+  if (c && c.ourRef) return c.ourRef;
+  return `${caseData.refBase}-${countryCode}`;
 }
 
 function buildOrderLetterData(caseData, countryCode) {
@@ -33,7 +43,7 @@ function buildOrderLetterData(caseData, countryCode) {
     pctNo: caseData.pctApplicationNumber,
     pctFilingDate: caseData.internationalFilingDate,
     applicantName: caseData.applicant.name,
-    ourRef: `${caseData.refBase}-${countryCode}`,
+    ourRef: resolveOurRef(caseData, countryCode),
     deadlineDate: c.deadlineDate,
     requestedFilingDate: c.requestedFilingDate,
   };
@@ -44,7 +54,7 @@ function buildInfoSheetData(caseData, countryCode) {
   const inv = caseData.inventors || [];
   const get = (i, field) => (inv[i] ? inv[i][field] || "" : "");
   return {
-    ourRef: `${caseData.refBase}-${countryCode}`,
+    ourRef: resolveOurRef(caseData, countryCode),
     title: caseData.titleOfInvention,
     priorityText: caseData.priorityText,
     entity: caseData.entity,
@@ -54,6 +64,8 @@ function buildInfoSheetData(caseData, countryCode) {
     inventor2Address: get(1, "address"),
     inventor3Name: get(2, "name"),
     inventor3Address: get(2, "address"),
+    inventor4Name: get(3, "name"),
+    inventor4Address: get(3, "address"),
     applicantName: caseData.applicant.name,
     applicantAddress: caseData.applicant.address,
     deadlineDate: c.deadlineDate,
@@ -87,10 +99,12 @@ function main() {
       continue;
     }
 
+    const ourRef = resolveOurRef(caseData, code);
+
     try {
       const ol = loadTemplate("order-letter", code);
       const olBuf = renderToBuffer(ol, buildOrderLetterData(caseData, code));
-      const olPath = path.join(outDir, `${caseData.refBase}-${code}_Order_Letter.docx`);
+      const olPath = path.join(outDir, `${ourRef}_Order_Letter.docx`);
       fs.writeFileSync(olPath, olBuf);
       console.log(`  [생성됨] ${olPath}`);
     } catch (e) {
@@ -100,7 +114,7 @@ function main() {
     try {
       const is = loadTemplate("information-sheet", code);
       const isBuf = renderToBuffer(is, buildInfoSheetData(caseData, code));
-      const isPath = path.join(outDir, `${caseData.refBase}-${code}_Information_Sheet.docx`);
+      const isPath = path.join(outDir, `${ourRef}_Information_Sheet.docx`);
       fs.writeFileSync(isPath, isBuf);
       console.log(`  [생성됨] ${isPath}`);
     } catch (e) {

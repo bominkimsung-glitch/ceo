@@ -4,9 +4,15 @@ const fs = require("fs");
 const path = require("path");
 const archiver = require("archiver");
 
-function zipCountry(caseDir, refBase, code) {
+function resolveOurRef(caseData, countryCode) {
+  const c = caseData.countries && caseData.countries[countryCode];
+  if (c && c.ourRef) return c.ourRef;
+  return `${caseData.refBase}-${countryCode}`;
+}
+
+function zipCountry(caseDir, ourRef, code) {
   return new Promise((resolve, reject) => {
-    const outPath = path.join(caseDir, `${refBase}-${code}_package.zip`);
+    const outPath = path.join(caseDir, `${ourRef}_package.zip`);
     const output = fs.createWriteStream(outPath);
     const archive = archiver("zip", { zlib: { level: 9 } });
 
@@ -16,8 +22,8 @@ function zipCountry(caseDir, refBase, code) {
     archive.pipe(output);
 
     const genDir = path.join(caseDir, "generated");
-    const olPath = path.join(genDir, `${refBase}-${code}_Order_Letter.docx`);
-    const isPath = path.join(genDir, `${refBase}-${code}_Information_Sheet.docx`);
+    const olPath = path.join(genDir, `${ourRef}_Order_Letter.docx`);
+    const isPath = path.join(genDir, `${ourRef}_Information_Sheet.docx`);
     if (fs.existsSync(olPath)) archive.file(olPath, { name: path.basename(olPath) });
     if (fs.existsSync(isPath)) archive.file(isPath, { name: path.basename(isPath) });
 
@@ -48,7 +54,7 @@ async function main() {
   const caseData = JSON.parse(fs.readFileSync(caseDataPath, "utf-8"));
 
   for (const code of countries) {
-    const outPath = await zipCountry(caseDir, caseData.refBase, code);
+    const outPath = await zipCountry(caseDir, resolveOurRef(caseData, code), code);
     console.log(`  [압축 완료] ${outPath}`);
   }
 }
