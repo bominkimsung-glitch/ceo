@@ -1,0 +1,13 @@
+# 의존성
+node_modules/
+
+# 실제 사건 데이터/생성 결과물 - 고객사 정보가 포함되므로 절대 커밋 금지
+output/
+
+# 실제 사용 템플릿(사무소 양식) - 저장소가 public이므로 커밋 금지
+templates/*.docx
+templates/*.pdf
+!templates/README.md
+
+# 로컬 환경설정
+.env

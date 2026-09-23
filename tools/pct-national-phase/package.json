@@ -1,0 +1,17 @@
+{
+  "name": "pct-national-phase",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PCT 국내단계 진입 서류(Order Letter, Information Sheet) 자동 생성 및 첨부파일 패키징 도구",
+  "type": "commonjs",
+  "scripts": {
+    "fetch": "node src/fetch-epct.js",
+    "generate": "node src/generate-docs.js",
+    "package": "node src/build-package.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "docx": "^9.0.2",
+    "playwright": "^1.47.0"
+  }
+}
