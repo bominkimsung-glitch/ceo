@@ -5,8 +5,8 @@ node_modules/
 output/
 
 # 실제 사용 템플릿(사무소 양식) - 저장소가 public이므로 커밋 금지
-templates/*.docx
-templates/*.pdf
+templates/**/*.docx
+templates/**/*.pdf
 !templates/README.md
 
 # 로컬 환경설정

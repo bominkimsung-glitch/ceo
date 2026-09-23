@@ -22,22 +22,28 @@ async function main() {
   const downloadDir = path.join(caseDir, "downloads");
   fs.mkdirSync(downloadDir, { recursive: true });
 
-  const biblioPath = path.join(caseDir, "bibliographic-data.json");
-  if (!fs.existsSync(biblioPath)) {
+  const caseDataPath = path.join(caseDir, "case-data.json");
+  if (!fs.existsSync(caseDataPath)) {
     fs.writeFileSync(
-      biblioPath,
+      caseDataPath,
       JSON.stringify(
         {
           pctApplicationNumber: pctNumber,
           internationalFilingDate: "",
-          applicants: [],
-          inventors: [],
+          letterDate: "",
+          refBase: "",
+          applicant: { name: "", address: "" },
+          inventors: [
+            { name: "", address: "" },
+            { name: "", address: "" },
+            { name: "", address: "" },
+          ],
           titleOfInvention: "",
-          priority: { number: "", date: "", country: "" },
-          isaOffice: "",
-          publicationNumber: "",
-          publicationDate: "",
-          entryCountries: [],
+          priorityText: "",
+          entity: "",
+          countries: {
+            US: { deadlineDate: "", requestedFilingDate: "" },
+          },
         },
         null,
         2
@@ -76,7 +82,7 @@ async function main() {
   console.log(" 4) 화면에 보이는 서지사항(출원인/발명자/우선권 등)을 아래 파일에");
   console.log("    직접 입력/수정해주세요 (자동으로 채워지지 않습니다 - 정확성을 위해");
   console.log("    사람이 직접 확인하고 입력하도록 설계했습니다):");
-  console.log(`       ${biblioPath}`);
+  console.log(`       ${caseDataPath}`);
   console.log(" 5) 다 받으셨으면 이 터미널로 돌아와서 Enter 키를 눌러주세요.");
   console.log("=========================================================");
   console.log("");
