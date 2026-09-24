@@ -2,8 +2,9 @@
 // 사건목록/서류목록 엑셀(DB)을 만든다.
 //
 // zip 파일명에는 출원번호가 없으므로, 안의 PDF 텍스트에서 출원번호를 찾아 사건을 식별한다.
-// 텍스트가 없는(스캔 이미지) PDF뿐이라 식별이 안 되는 zip은 _미식별 폴더로 보내고,
-// input/mapping.csv 에 수동으로 적어주면 다음 실행 때 반영된다.
+// 미국·유럽 서류처럼 전부 스캔 이미지라 텍스트가 없으면, 번호가 적혀 있을 만한 서류 몇 개의
+// 첫 페이지를 OCR 한다 (결과는 output/ocr-cache.json 에 저장해 다음 실행 때 재사용).
+// 그래도 식별이 안 되는 zip은 _미식별 폴더로 보내고, input/mapping.csv 에 적어주면 반영된다.
 const fs = require("fs");
 const path = require("path");
 const AdmZip = require("adm-zip");
@@ -12,6 +13,15 @@ const ExcelJS = require("exceljs");
 
 const ROOT = path.join(__dirname, "..");
 const PDFJS_DIR = path.dirname(require.resolve("pdfjs-dist/package.json"));
+const TESS_LANG_DIR = path.join(path.dirname(require.resolve("@tesseract.js-data/eng/package.json")), "4.0.0_best_int");
+
+// OCR 할 서류 우선순위 (서류명에 포함된 단어, 소문자). 출원번호가 큼직하게 찍히는 관청 통지서 위주.
+const OCR_PRIORITY = [
+  "filing receipt", "bibliographic data", "non-final rejection", "nonfinal rejection", "final rejection",
+  "notice of allowance", "notice of publication", "communication", "notification", "search opinion",
+  "notice", "receipt",
+];
+const OCR_MAX_DOCS = 5;
 const UNIDENTIFIED_DIR = "_미식별";
 
 // 사무소 관리번호 형식 (예: ABCD240001KRA). 다르면 config.json 의 refPattern 으로 바꾼다.
@@ -97,19 +107,25 @@ function entryName(entry) {
 }
 
 let pdfjsPromise;
+function openPdf(pdfjs, buffer) {
+  return pdfjs.getDocument({
+    data: new Uint8Array(buffer),
+    cMapUrl: path.join(PDFJS_DIR, "cmaps") + path.sep,
+    cMapPacked: true,
+    standardFontDataUrl: path.join(PDFJS_DIR, "standard_fonts") + path.sep,
+    // 스캔 PDF의 팩스(CCITT)·JBIG2 이미지 디코더. 없으면 빈 페이지로 렌더링된다
+    wasmUrl: path.join(PDFJS_DIR, "wasm") + path.sep,
+    disableFontFace: true,
+    verbosity: 0,
+  });
+}
+
 async function pdfText(buffer, maxPages = 2) {
   pdfjsPromise = pdfjsPromise || import("pdfjs-dist/legacy/build/pdf.mjs");
   const pdfjs = await pdfjsPromise;
   let task;
   try {
-    task = pdfjs.getDocument({
-      data: new Uint8Array(buffer),
-      cMapUrl: path.join(PDFJS_DIR, "cmaps") + path.sep,
-      cMapPacked: true,
-      standardFontDataUrl: path.join(PDFJS_DIR, "standard_fonts") + path.sep,
-      disableFontFace: true,
-      verbosity: 0,
-    });
+    task = openPdf(pdfjs, buffer);
     const doc = await task.promise;
     let text = "";
     for (let i = 1; i <= Math.min(maxPages, doc.numPages); i++) {
@@ -124,6 +140,38 @@ async function pdfText(buffer, maxPages = 2) {
   } finally {
     if (task) await task.destroy();
   }
+}
+
+// 스캔 PDF 첫 페이지를 이미지로 그려 OCR 한다. OCR 엔진은 처음 필요할 때 한 번만 띄운다.
+let ocrWorkerPromise;
+async function ocrFirstPage(buffer) {
+  const { createWorker } = require("tesseract.js");
+  const { createCanvas } = require("@napi-rs/canvas");
+  ocrWorkerPromise = ocrWorkerPromise || createWorker("eng", 1, { langPath: TESS_LANG_DIR, gzip: true, cacheMethod: "none" });
+  pdfjsPromise = pdfjsPromise || import("pdfjs-dist/legacy/build/pdf.mjs");
+  const [worker, pdfjs] = await Promise.all([ocrWorkerPromise, pdfjsPromise]);
+  const task = openPdf(pdfjs, buffer);
+  try {
+    const doc = await task.promise;
+    const page = await doc.getPage(1);
+    const viewport = page.getViewport({ scale: 200 / 72 });
+    const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, canvas, viewport }).promise;
+    const { data } = await worker.recognize(canvas.toBuffer("image/png"));
+    return data.text;
+  } catch (err) {
+    console.warn(`\n  [경고] OCR 실패: ${err.message}`);
+    return "";
+  } finally {
+    await task.destroy();
+  }
+}
+
+async function closeOcr() {
+  if (ocrWorkerPromise) await (await ocrWorkerPromise).terminate();
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +199,8 @@ function findAppNumbers(text) {
   // 유럽: 23123456.7 (중국 번호 안의 숫자와 겹치지 않게 앞뒤 숫자 금지)
   const ep = /(?:Application (?:No|number)\.?|Anmeldenummer|N° de demande)[^0-9]{0,15}(?<!\d)(\d{2}\s?\d{3}\s?\d{3}\s?\.\s?\d)(?!\d)/gi;
   while ((m = ep.exec(text))) push("EP", m[1].replace(/\s/g, ""));
+  const epPrefixed = /\bEP\s?(\d{2}\s?\d{3}\s?\d{3}\s?\.\s?\d)(?!\d)/g;
+  while ((m = epPrefixed.exec(text))) push("EP", m[1].replace(/\s/g, ""));
 
   // 일본: 特願2023-123456
   const jp = /(?:特願|Japanese Patent Application No\.?)\s?(\d{4})\s?[-‐―]\s?(\d{1,6})/g;
@@ -164,7 +214,7 @@ function findAppNumbers(text) {
 }
 
 function findPct(text) {
-  const m = text.match(/PCT\s?\/\s?([A-Z]{2})\s?(\d{4})\s?\/\s?(\d{6})/);
+  const m = text.match(/PCT\s?\/\s?([A-Z]{2})\s?(\d{4})\s?\/?\s?(\d{6})(?!\d)/);
   return m ? `PCT/${m[1]}${m[2]}/${m[3]}` : "";
 }
 
@@ -237,7 +287,32 @@ function safeFileName(s) {
 // ---------------------------------------------------------------------------
 // zip 1개 처리
 
-async function readZip(zipPath, cfg) {
+// 텍스트에서 해외 번호를 못 찾았을 때만 OCR 한다. 두 서류에서 같은 번호가 나오면 멈춘다.
+async function ocrNumbers(docs) {
+  const rank = (d) => {
+    const t = d.title.toLowerCase();
+    const i = OCR_PRIORITY.findIndex((k) => t.includes(k));
+    return i === -1 ? OCR_PRIORITY.length : i;
+  };
+  const candidates = docs
+    .filter((d) => /\.pdf$/i.test(d.originalName))
+    .sort((a, b) => rank(a) - rank(b) || b.date.localeCompare(a.date))
+    .slice(0, OCR_MAX_DOCS);
+
+  const numbers = [];
+  let pct = "";
+  for (const doc of candidates) {
+    const text = normalizeText(await ocrFirstPage(doc.data));
+    numbers.push(...findAppNumbers(text).filter((n) => n.country !== "KR"));
+    pct = pct || findPct(text);
+    const counts = new Map();
+    for (const n of numbers) counts.set(n.appNo, (counts.get(n.appNo) || 0) + 1);
+    if ([...counts.values()].some((c) => c >= 2)) break;
+  }
+  return { numbers, pct };
+}
+
+async function readZip(zipPath, cfg, ocrCache) {
   const zip = new AdmZip(zipPath);
   const docs = [];
   const numbers = [];
@@ -266,14 +341,30 @@ async function readZip(zipPath, cfg) {
     docs.push(doc);
   }
 
+  // 해외 번호가 텍스트에 없으면 (스캔 PDF) OCR 로 보완한다
+  let foreign = numbers.filter((n) => n.country !== "KR");
+  let ocr = false;
+  // KIPRIS 한국 사건은 서류명이 한글이다. 그 경우 한국 번호로 충분하므로 OCR 하지 않는다.
+  const koreanCase = docs.some((d) => /[\uac00-\ud7a3]/.test(d.title)) && numbers.length > 0;
+  if (foreign.length === 0 && docs.length > 0 && !koreanCase) {
+    const cacheKey = `${path.basename(zipPath)}|${fs.statSync(zipPath).size}`;
+    if (!ocrCache[cacheKey]) {
+      process.stdout.write("OCR 중... ");
+      ocrCache[cacheKey] = await ocrNumbers(docs);
+    }
+    foreign = ocrCache[cacheKey].numbers;
+    pct = pct || ocrCache[cacheKey].pct;
+    ocr = foreign.length > 0;
+    numbers.push(...foreign);
+  }
+
   // 가장 많이 나온 번호를 채택 (서류 여러 개에서 같은 번호가 반복되므로).
   // 한국 번호는 해외 사건 서류에 우선권 번호로도 나오므로 다른 국가 번호가 하나도 없을 때만 쓴다.
-  const foreign = numbers.filter((n) => n.country !== "KR");
   const best = mostCommon((foreign.length ? foreign : numbers).map((n) => `${n.country}|${n.appNo}`));
   const [country, appNo] = best ? best.split("|") : ["", ""];
   const agentRef = mostCommon(agentRefs);
   const ref = mostCommon(labeledRefs) || mostCommon(refs.filter((r) => r !== agentRef));
-  return { docs, country, appNo, pct, ref, agentRef };
+  return { docs, country, appNo, pct, ref, agentRef, ocr };
 }
 
 // ---------------------------------------------------------------------------
@@ -310,13 +401,16 @@ async function main() {
   fs.rmSync(casesDir, { recursive: true, force: true });
   fs.mkdirSync(casesDir, { recursive: true });
 
+  const ocrCachePath = path.join(outputDir, "ocr-cache.json");
+  const ocrCache = fs.existsSync(ocrCachePath) ? JSON.parse(fs.readFileSync(ocrCachePath, "utf8")) : {};
+
   const cases = new Map(); // key -> { country, appNo, pct, ref, zips:Set, docs:[] }
 
   for (const zipFile of zipFiles) {
     process.stdout.write(`- ${zipFile} ... `);
     let info;
     try {
-      info = await readZip(path.join(inputDir, zipFile), cfg);
+      info = await readZip(path.join(inputDir, zipFile), cfg, ocrCache);
     } catch (err) {
       console.log(`읽기 실패 (${err.message})`);
       continue;
@@ -337,7 +431,7 @@ async function main() {
     if (!cases.has(key)) {
       cases.set(key, {
         key, identified, country: info.country, appNo: info.appNo,
-        pct: info.pct, ref: info.ref, agentRef: info.agentRef, zips: new Set(), docs: [],
+        pct: info.pct, ref: info.ref, agentRef: info.agentRef, ocr: info.ocr && !manual, zips: new Set(), docs: [],
       });
     }
     const c = cases.get(key);
@@ -351,8 +445,11 @@ async function main() {
       const dup = c.docs.find((d) => d.originalName === doc.originalName && d.data.length === doc.data.length);
       if (!dup) c.docs.push({ ...doc, zip: zipFile });
     }
-    console.log(identified ? `${info.country} ${info.appNo}${manual ? " (mapping.csv)" : ""}` : "출원번호 못 찾음 -> _미식별");
+    const how = manual ? " (mapping.csv)" : info.ocr ? " (OCR)" : "";
+    console.log(identified ? `${info.country} ${info.appNo}${how}` : "출원번호 못 찾음 -> _미식별");
   }
+  await closeOcr();
+  fs.writeFileSync(ocrCachePath, JSON.stringify(ocrCache, null, 2));
 
   // 파일 쓰기 + 분류
   const docRows = [];
@@ -392,17 +489,19 @@ async function main() {
       ref: c.ref, agentRef: c.agentRef, country: c.country, appNo: c.appNo, pct: c.pct,
       docCount: c.docs.length, firstDate, lastDate: last ? last.date : "", lastDoc: last ? last.title : "",
       folder: path.posix.join("cases", c.key), zips: [...c.zips].join(", "),
-      status: c.identified ? "" : "출원번호 확인 필요 (mapping.csv에 입력 후 재실행)",
+      status: !c.identified ? "출원번호 확인 필요 (mapping.csv에 입력 후 재실행)" : c.ocr ? "OCR로 인식 - 번호 확인 권장" : "",
     });
   }
 
   const xlsxPath = path.join(outputDir, "filewrapper_db.xlsx");
   await writeWorkbook(xlsxPath, caseRows, docRows);
 
-  const unidentified = caseRows.filter((r) => r.status).length;
+  const unidentified = caseRows.filter((r) => !r.appNo).length;
+  const byOcr = caseRows.filter((r) => r.appNo && r.status).length;
   console.log("");
   console.log(`사건 ${caseRows.length}건 / 서류 ${docRows.length}개 정리 완료`);
   console.log(`엑셀: ${xlsxPath}`);
+  if (byOcr) console.log(`[참고] OCR로 출원번호를 읽은 사건 ${byOcr}건 -> 엑셀 "사건목록"에서 번호 한 번 확인 권장`);
   if (unidentified) console.log(`[확인 필요] 출원번호를 못 찾은 zip ${unidentified}개 -> 엑셀 "사건목록"의 상태 열 참고`);
 }
 

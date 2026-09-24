@@ -8,9 +8,12 @@
     "organize": "node src/organize.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^1.0.9",
+    "@tesseract.js-data/eng": "^1.0.0",
     "adm-zip": "^0.6.1",
     "exceljs": "^4.4.0",
     "iconv-lite": "^0.7.3",
-    "pdfjs-dist": "^6.3.289"
+    "pdfjs-dist": "^6.3.289",
+    "tesseract.js": "^7.0.0"
   }
 }
