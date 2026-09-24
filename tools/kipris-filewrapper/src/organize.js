@@ -554,7 +554,13 @@ async function writeWorkbook(xlsxPath, caseRows, docRows) {
   await wb.xlsx.writeFile(xlsxPath);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  entryName, parseDocFileName, safeFileName, loadConfig, FILING_KEYWORDS,
+};
