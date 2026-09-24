@@ -1,0 +1,395 @@
+// KIPRIS 해외 "심사정보조회"에서 받은 file wrapper zip들을 사건별 폴더로 풀고,
+// 사건목록/서류목록 엑셀(DB)을 만든다.
+//
+// zip 파일명에는 출원번호가 없으므로, 안의 PDF 텍스트에서 출원번호를 찾아 사건을 식별한다.
+// 텍스트가 없는(스캔 이미지) PDF뿐이라 식별이 안 되는 zip은 _미식별 폴더로 보내고,
+// input/mapping.csv 에 수동으로 적어주면 다음 실행 때 반영된다.
+const fs = require("fs");
+const path = require("path");
+const AdmZip = require("adm-zip");
+const iconv = require("iconv-lite");
+const ExcelJS = require("exceljs");
+
+const ROOT = path.join(__dirname, "..");
+const PDFJS_DIR = path.dirname(require.resolve("pdfjs-dist/package.json"));
+const UNIDENTIFIED_DIR = "_미식별";
+
+// 사무소 관리번호 형식 (예: ABCD240001KRA). 다르면 config.json 의 refPattern 으로 바꾼다.
+const DEFAULT_REF_PATTERN = "\\b[A-Z]{2,5}\\d{5,6}[A-Z]{0,4}\\b";
+
+// 날짜와 상관없이 "등록"으로 분류할 서류명 키워드 (소문자로 비교)
+const DEFAULT_GRANT_KEYWORDS = [
+  "grant", "registration", "register", "allowance", "certificate", "letters patent",
+  "patent right", "annual fee", "annuity", "renewal", "issue fee", "issue notification",
+  "decision to grant", "intention to grant",
+];
+
+// ---------------------------------------------------------------------------
+// 설정 / 수동 매핑
+
+function loadConfig() {
+  const p = path.join(ROOT, "config.json");
+  const cfg = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, "utf8")) : {};
+  return {
+    refPattern: new RegExp(cfg.refPattern || DEFAULT_REF_PATTERN, "g"),
+    grantKeywords: (cfg.grantKeywords || DEFAULT_GRANT_KEYWORDS).map((k) => k.toLowerCase()),
+  };
+}
+
+// mapping.csv: zip파일명,국가,출원번호,관리번호  (첫 줄은 헤더)
+function loadMapping(inputDir) {
+  const p = path.join(inputDir, "mapping.csv");
+  const map = new Map();
+  if (!fs.existsSync(p)) return map;
+  const text = fs.readFileSync(p, "utf8").replace(/^﻿/, "");
+  for (const line of text.split(/\r?\n/).slice(1)) {
+    if (!line.trim()) continue;
+    const [zipName, country, appNo, ref] = splitCsvLine(line).map((s) => (s || "").trim());
+    if (zipName) map.set(zipName, { country: country.toUpperCase(), appNo, ref });
+  }
+  return map;
+}
+
+// 엑셀에서 저장한 CSV는 쉼표가 든 값(예: "17/123,456")을 따옴표로 감싼다.
+function splitCsvLine(line) {
+  const out = [];
+  let cur = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted && ch === '"' && line[i + 1] === '"') {
+      cur += '"';
+      i++;
+    } else if (ch === '"') {
+      quoted = !quoted;
+    } else if (ch === "," && !quoted) {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// zip / pdf 읽기
+
+// 한국어 윈도우에서 만든 zip은 파일명이 CP949라서 UTF-8 플래그가 없으면 CP949로 디코딩한다.
+function entryName(entry) {
+  const raw = entry.rawEntryName;
+  if (entry.header.flags & 0x800) return raw.toString("utf8");
+  const asUtf8 = raw.toString("utf8");
+  if (!asUtf8.includes("�")) return asUtf8;
+  return iconv.decode(raw, "cp949");
+}
+
+let pdfjsPromise;
+async function pdfText(buffer, maxPages = 2) {
+  pdfjsPromise = pdfjsPromise || import("pdfjs-dist/legacy/build/pdf.mjs");
+  const pdfjs = await pdfjsPromise;
+  let task;
+  try {
+    task = pdfjs.getDocument({
+      data: new Uint8Array(buffer),
+      cMapUrl: path.join(PDFJS_DIR, "cmaps") + path.sep,
+      cMapPacked: true,
+      standardFontDataUrl: path.join(PDFJS_DIR, "standard_fonts") + path.sep,
+      disableFontFace: true,
+      verbosity: 0,
+    });
+    const doc = await task.promise;
+    let text = "";
+    for (let i = 1; i <= Math.min(maxPages, doc.numPages); i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      text += content.items.map((it) => it.str).join(" ") + "\n";
+    }
+    return { text, pages: doc.numPages };
+  } catch (err) {
+    console.warn(`\n  [경고] PDF 텍스트 추출 실패: ${err.message}`);
+    return { text: "", pages: null };
+  } finally {
+    if (task) await task.destroy();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 출원번호 찾기
+
+function normalizeSpaces(s) {
+  return s.replace(/[\s　]+/g, " ");
+}
+
+// 텍스트에서 국가별 출원번호 후보를 뽑는다. 결과: [{country, appNo}]
+function findAppNumbers(rawText) {
+  const text = normalizeSpaces(rawText);
+  const found = [];
+  const push = (country, appNo) => found.push({ country, appNo });
+  let m;
+
+  // 중국: 202380012345.6 (12자리 + 체크디지트)
+  const cn = /(?:申请号|专利号|Application No\.?)[^0-9]{0,15}((?:19|20)\d{10}\s?\.\s?[\dX])/g;
+  while ((m = cn.exec(text))) push("CN", m[1].replace(/\s/g, ""));
+
+  // 미국: 17/123,456
+  const us = /\b(\d{2})\s?\/\s?(\d{3}),?(\d{3})\b/g;
+  while ((m = us.exec(text))) push("US", `${m[1]}/${m[2]},${m[3]}`);
+
+  // 유럽: 23123456.7 (중국 번호 안의 숫자와 겹치지 않게 앞뒤 숫자 금지)
+  const ep = /(?:Application (?:No|number)\.?|Anmeldenummer|N° de demande)[^0-9]{0,15}(?<!\d)(\d{2}\s?\d{3}\s?\d{3}\s?\.\s?\d)(?!\d)/gi;
+  while ((m = ep.exec(text))) push("EP", m[1].replace(/\s/g, ""));
+
+  // 일본: 特願2023-123456
+  const jp = /特願\s?(\d{4})\s?[-－‐―]\s?(\d{1,6})/g;
+  while ((m = jp.exec(text))) push("JP", `${m[1]}-${m[2].padStart(6, "0")}`);
+
+  return found;
+}
+
+function findPct(text) {
+  const m = normalizeSpaces(text).match(/PCT\s?\/\s?([A-Z]{2})\s?(\d{4})\s?\/\s?(\d{6})/);
+  return m ? `PCT/${m[1]}${m[2]}/${m[3]}` : "";
+}
+
+function mostCommon(values) {
+  const counts = new Map();
+  for (const v of values) counts.set(v, (counts.get(v) || 0) + 1);
+  let best = "";
+  let bestCount = 0;
+  for (const [v, c] of counts) {
+    if (c > bestCount) {
+      best = v;
+      bestCount = c;
+    }
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------------------
+// 서류명 / 분류
+
+// "20240315_Request for substantive examination ORIGINAL.pdf" -> { date, title, version }
+function parseDocFileName(name) {
+  const base = path.basename(name).replace(/\.pdf$/i, "");
+  const m = base.match(/^(\d{4})(\d{2})(\d{2})_(.*)$/);
+  if (!m) return { date: "", title: base.trim(), version: "" };
+  let title = m[4].replace(/\s+/g, " ").trim();
+  let version = "";
+  const v = title.match(/\s(ORIGINAL|TRANSLATION|TRANSLATED|MACHINE TRANSLATION)$/i);
+  if (v) {
+    version = v[1].toUpperCase();
+    title = title.slice(0, v.index).trim();
+  }
+  return { date: `${m[1]}-${m[2]}-${m[3]}`, title, version };
+}
+
+// 등록 키워드가 있으면 "등록", 사건의 최초 일자 서류면 "출원", 나머지는 "중간".
+function classify(doc, firstDate, grantKeywords) {
+  const t = doc.title.toLowerCase();
+  if (grantKeywords.some((k) => t.includes(k))) return "등록";
+  if (doc.date && doc.date === firstDate) return "출원";
+  return "중간";
+}
+
+function safeFileName(s) {
+  return s.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim().slice(0, 150);
+}
+
+// ---------------------------------------------------------------------------
+// zip 1개 처리
+
+async function readZip(zipPath, cfg) {
+  const zip = new AdmZip(zipPath);
+  const docs = [];
+  const numbers = [];
+  const refs = [];
+  let pct = "";
+
+  for (const entry of zip.getEntries()) {
+    if (entry.isDirectory) continue;
+    const name = entryName(entry);
+    const data = entry.getData();
+    const doc = { ...parseDocFileName(name), originalName: path.basename(name), data, pages: null };
+
+    if (/\.pdf$/i.test(name)) {
+      const { text, pages } = await pdfText(data);
+      doc.pages = pages;
+      numbers.push(...findAppNumbers(text));
+      pct = pct || findPct(text);
+      refs.push(...(text.match(cfg.refPattern) || []));
+    }
+    docs.push(doc);
+  }
+
+  // 가장 많이 나온 국가별 번호를 채택 (서류 여러 개에서 같은 번호가 반복되므로)
+  const best = mostCommon(numbers.map((n) => `${n.country}|${n.appNo}`));
+  const [country, appNo] = best ? best.split("|") : ["", ""];
+  return { docs, country, appNo, pct, ref: mostCommon(refs) };
+}
+
+// ---------------------------------------------------------------------------
+// 메인
+
+async function main() {
+  const inputDir = path.resolve(process.argv[2] || path.join(ROOT, "input"));
+  const outputDir = path.resolve(process.argv[3] || path.join(ROOT, "output"));
+  if (!fs.existsSync(inputDir)) {
+    console.error(`입력 폴더가 없습니다: ${inputDir}`);
+    process.exit(1);
+  }
+  const cfg = loadConfig();
+  const mapping = loadMapping(inputDir);
+  const zipFiles = fs.readdirSync(inputDir).filter((f) => /\.zip$/i.test(f)).sort();
+  if (zipFiles.length === 0) {
+    console.error(`zip 파일이 없습니다: ${inputDir}`);
+    process.exit(1);
+  }
+
+  // 매번 zip 전체로부터 다시 만든다 (결과물을 직접 수정하지 말 것)
+  const casesDir = path.join(outputDir, "cases");
+  fs.rmSync(casesDir, { recursive: true, force: true });
+  fs.mkdirSync(casesDir, { recursive: true });
+
+  const cases = new Map(); // key -> { country, appNo, pct, ref, zips:Set, docs:[] }
+
+  for (const zipFile of zipFiles) {
+    process.stdout.write(`- ${zipFile} ... `);
+    let info;
+    try {
+      info = await readZip(path.join(inputDir, zipFile), cfg);
+    } catch (err) {
+      console.log(`읽기 실패 (${err.message})`);
+      continue;
+    }
+
+    const manual = mapping.get(zipFile);
+    if (manual) {
+      info.country = manual.country || info.country;
+      info.appNo = manual.appNo || info.appNo;
+      info.ref = manual.ref || info.ref;
+    }
+
+    const identified = Boolean(info.country && info.appNo);
+    const key = identified
+      ? `${info.country}_${info.appNo.replace(/[\/,]/g, "")}`
+      : `${UNIDENTIFIED_DIR}/${zipFile.replace(/\.zip$/i, "")}`;
+
+    if (!cases.has(key)) {
+      cases.set(key, {
+        key, identified, country: info.country, appNo: info.appNo,
+        pct: info.pct, ref: info.ref, zips: new Set(), docs: [],
+      });
+    }
+    const c = cases.get(key);
+    c.pct = c.pct || info.pct;
+    c.ref = c.ref || info.ref;
+    c.zips.add(zipFile);
+
+    // 같은 사건을 나중에 다시 받은 경우 같은 서류는 한 번만 넣는다
+    for (const doc of info.docs) {
+      const dup = c.docs.find((d) => d.originalName === doc.originalName && d.data.length === doc.data.length);
+      if (!dup) c.docs.push({ ...doc, zip: zipFile });
+    }
+    console.log(identified ? `${info.country} ${info.appNo}${manual ? " (mapping.csv)" : ""}` : "출원번호 못 찾음 -> _미식별");
+  }
+
+  // 파일 쓰기 + 분류
+  const docRows = [];
+  const caseRows = [];
+  for (const c of [...cases.values()].sort((a, b) => a.key.localeCompare(b.key))) {
+    const dir = path.join(casesDir, c.key);
+    fs.mkdirSync(dir, { recursive: true });
+    c.docs.sort((a, b) => (a.date + a.title).localeCompare(b.date + b.title));
+    const dates = c.docs.map((d) => d.date).filter(Boolean);
+    const firstDate = dates.length ? dates.reduce((a, b) => (a < b ? a : b)) : "";
+
+    const used = new Set();
+    for (const doc of c.docs) {
+      const ext = path.extname(doc.originalName) || ".pdf";
+      const stem = safeFileName([doc.date, doc.title, doc.version && doc.version !== "ORIGINAL" ? doc.version : ""]
+        .filter(Boolean).join("_"));
+      let fileName = `${stem}${ext}`;
+      for (let i = 2; used.has(fileName.toLowerCase()); i++) fileName = `${stem} (${i})${ext}`;
+      used.add(fileName.toLowerCase());
+      fs.writeFileSync(path.join(dir, fileName), doc.data);
+
+      docRows.push({
+        ref: c.ref, country: c.country, appNo: c.appNo, date: doc.date,
+        category: c.identified ? classify(doc, firstDate, cfg.grantKeywords) : "",
+        title: doc.title, version: doc.version, pages: doc.pages,
+        file: path.posix.join("cases", c.key, fileName), zip: doc.zip,
+      });
+    }
+
+    const last = c.docs[c.docs.length - 1];
+    caseRows.push({
+      ref: c.ref, country: c.country, appNo: c.appNo, pct: c.pct,
+      docCount: c.docs.length, firstDate, lastDate: last ? last.date : "", lastDoc: last ? last.title : "",
+      folder: path.posix.join("cases", c.key), zips: [...c.zips].join(", "),
+      status: c.identified ? "" : "출원번호 확인 필요 (mapping.csv에 입력 후 재실행)",
+    });
+  }
+
+  const xlsxPath = path.join(outputDir, "filewrapper_db.xlsx");
+  await writeWorkbook(xlsxPath, caseRows, docRows);
+
+  const unidentified = caseRows.filter((r) => r.status).length;
+  console.log("");
+  console.log(`사건 ${caseRows.length}건 / 서류 ${docRows.length}개 정리 완료`);
+  console.log(`엑셀: ${xlsxPath}`);
+  if (unidentified) console.log(`[확인 필요] 출원번호를 못 찾은 zip ${unidentified}개 -> 엑셀 "사건목록"의 상태 열 참고`);
+}
+
+async function writeWorkbook(xlsxPath, caseRows, docRows) {
+  const wb = new ExcelJS.Workbook();
+
+  const cs = wb.addWorksheet("사건목록", { views: [{ state: "frozen", ySplit: 1 }] });
+  cs.columns = [
+    { header: "관리번호(추정)", key: "ref", width: 18 },
+    { header: "국가", key: "country", width: 6 },
+    { header: "출원번호", key: "appNo", width: 18 },
+    { header: "PCT번호", key: "pct", width: 20 },
+    { header: "서류수", key: "docCount", width: 8 },
+    { header: "최초서류일", key: "firstDate", width: 12 },
+    { header: "최근서류일", key: "lastDate", width: 12 },
+    { header: "최근서류", key: "lastDoc", width: 50 },
+    { header: "폴더", key: "folder", width: 30 },
+    { header: "원본zip", key: "zips", width: 30 },
+    { header: "상태", key: "status", width: 40 },
+  ];
+  for (const r of caseRows) {
+    const row = cs.addRow(r);
+    row.getCell("folder").value = { text: r.folder, hyperlink: r.folder };
+  }
+
+  const ds = wb.addWorksheet("서류목록", { views: [{ state: "frozen", ySplit: 1 }] });
+  ds.columns = [
+    { header: "관리번호(추정)", key: "ref", width: 18 },
+    { header: "국가", key: "country", width: 6 },
+    { header: "출원번호", key: "appNo", width: 18 },
+    { header: "일자", key: "date", width: 12 },
+    { header: "서류구분", key: "category", width: 9 },
+    { header: "서류명", key: "title", width: 60 },
+    { header: "버전", key: "version", width: 12 },
+    { header: "페이지", key: "pages", width: 8 },
+    { header: "파일", key: "file", width: 50 },
+    { header: "원본zip", key: "zip", width: 30 },
+  ];
+  for (const r of docRows) {
+    const row = ds.addRow(r);
+    row.getCell("file").value = { text: r.file, hyperlink: r.file };
+  }
+
+  for (const ws of [cs, ds]) {
+    ws.getRow(1).font = { bold: true };
+    ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: ws.columns.length } };
+  }
+  await wb.xlsx.writeFile(xlsxPath);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

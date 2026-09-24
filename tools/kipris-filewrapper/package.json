@@ -1,0 +1,16 @@
+{
+  "name": "kipris-filewrapper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "KIPRIS 해외 심사정보조회에서 받은 file wrapper zip을 사건별로 풀고 서류 목록 엑셀(DB)을 만드는 도구",
+  "type": "commonjs",
+  "scripts": {
+    "organize": "node src/organize.js"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.1",
+    "exceljs": "^4.4.0",
+    "iconv-lite": "^0.7.3",
+    "pdfjs-dist": "^6.3.289"
+  }
+}

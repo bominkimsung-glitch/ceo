@@ -1,0 +1,6 @@
+# 의존성
+node_modules/
+
+# 실제 사건 zip / 정리 결과물 - 고객사 정보가 포함되므로 절대 커밋 금지
+input/
+output/
