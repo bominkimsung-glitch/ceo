@@ -156,7 +156,7 @@ function findAppNumbers(text) {
   const jp = /(?:特願|Japanese Patent Application No\.?)\s?(\d{4})\s?[-‐―]\s?(\d{1,6})/g;
   while ((m = jp.exec(text))) push("JP", `${m[1]}-${m[2].padStart(6, "0")}`);
 
-  // 한국: 10-2021-0122994 (해외 사건 서류에도 우선권 번호로 자주 나오므로 채택 우선순위는 가장 낮다)
+  // 한국: 10-2023-0123456 (해외 사건 서류에도 우선권 번호로 자주 나오므로 채택 우선순위는 가장 낮다)
   const kr = /(?<![\d-])((?:10|20)-\d{4}-\d{7})(?![\d-])/g;
   while ((m = kr.exec(text))) push("KR", m[1]);
 
