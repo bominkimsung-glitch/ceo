@@ -7,6 +7,8 @@ description: 해외출원 사건 폴더의 KIPRIS file wrapper 이력(캡처 이
 
 도구: `tools/kipris-filewrapper` (자세한 내용은 그 폴더의 README.md "사건 폴더 정리" 참고)
 
+작업 전에 `tools/kipris-filewrapper/NEXT.md`(진행 현황 / 남은 할 일)를 먼저 읽는다.
+
 ## 폴더 구조
 
 ```
