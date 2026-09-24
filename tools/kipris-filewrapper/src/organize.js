@@ -17,11 +17,18 @@ const UNIDENTIFIED_DIR = "_미식별";
 // 사무소 관리번호 형식 (예: ABCD240001KRA). 다르면 config.json 의 refPattern 으로 바꾼다.
 const DEFAULT_REF_PATTERN = "\\b[A-Z]{2,5}\\d{5,6}[A-Z]{0,4}\\b";
 
-// 날짜와 상관없이 "등록"으로 분류할 서류명 키워드 (소문자로 비교)
+// "등록"으로 분류할 서류명 키워드 (소문자로 비교)
 const DEFAULT_GRANT_KEYWORDS = [
   "grant", "registration", "register", "allowance", "certificate", "letters patent",
   "patent right", "annual fee", "annuity", "renewal", "issue fee", "issue notification",
-  "decision to grant", "intention to grant",
+  "등록결정", "특허결정", "설정등록", "등록료", "연차료", "등록증", "특허증",
+];
+
+// 출원일을 정하는 데 쓰는 출원 서류 키워드. 이 서류들이 처음 나온 날짜의 서류를 "출원"으로 본다.
+// (국내단계 진입 전에 명의변경 통지 등이 먼저 올 수 있어서 단순히 가장 이른 날짜를 쓰면 안 된다)
+const FILING_KEYWORDS = [
+  "description", "specification", "claims", "abstract", "national entry", "application form",
+  "특허출원서", "명세서", "청구범위", "요약서",
 ];
 
 // ---------------------------------------------------------------------------
@@ -32,6 +39,10 @@ function loadConfig() {
   const cfg = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, "utf8")) : {};
   return {
     refPattern: new RegExp(cfg.refPattern || DEFAULT_REF_PATTERN, "g"),
+    // 한국 서식의 참조번호 = 우리 사무소 관리번호
+    refLabelPattern: /【참조번호】\s*([A-Za-z0-9-]{4,20})/g,
+    // 일본 서식의 整理番号 = 현지 대리인 관리번호
+    agentRefLabelPattern: /(?:【整理番号】|\[Reference Number\])\s*([A-Za-z0-9-]{4,20})/g,
     grantKeywords: (cfg.grantKeywords || DEFAULT_GRANT_KEYWORDS).map((k) => k.toLowerCase()),
   };
 }
@@ -118,13 +129,13 @@ async function pdfText(buffer, maxPages = 2) {
 // ---------------------------------------------------------------------------
 // 출원번호 찾기
 
-function normalizeSpaces(s) {
-  return s.replace(/[\s　]+/g, " ");
+// 일본 서류의 전각 숫자(２０２４－５１６９８５)를 반각으로 바꾸고 공백을 정리한다
+function normalizeText(s) {
+  return s.normalize("NFKC").replace(/\s+/g, " ");
 }
 
 // 텍스트에서 국가별 출원번호 후보를 뽑는다. 결과: [{country, appNo}]
-function findAppNumbers(rawText) {
-  const text = normalizeSpaces(rawText);
+function findAppNumbers(text) {
   const found = [];
   const push = (country, appNo) => found.push({ country, appNo });
   let m;
@@ -142,14 +153,18 @@ function findAppNumbers(rawText) {
   while ((m = ep.exec(text))) push("EP", m[1].replace(/\s/g, ""));
 
   // 일본: 特願2023-123456
-  const jp = /特願\s?(\d{4})\s?[-－‐―]\s?(\d{1,6})/g;
+  const jp = /(?:特願|Japanese Patent Application No\.?)\s?(\d{4})\s?[-‐―]\s?(\d{1,6})/g;
   while ((m = jp.exec(text))) push("JP", `${m[1]}-${m[2].padStart(6, "0")}`);
+
+  // 한국: 10-2021-0122994 (해외 사건 서류에도 우선권 번호로 자주 나오므로 채택 우선순위는 가장 낮다)
+  const kr = /(?<![\d-])((?:10|20)-\d{4}-\d{7})(?![\d-])/g;
+  while ((m = kr.exec(text))) push("KR", m[1]);
 
   return found;
 }
 
 function findPct(text) {
-  const m = normalizeSpaces(text).match(/PCT\s?\/\s?([A-Z]{2})\s?(\d{4})\s?\/\s?(\d{6})/);
+  const m = text.match(/PCT\s?\/\s?([A-Z]{2})\s?(\d{4})\s?\/\s?(\d{6})/);
   return m ? `PCT/${m[1]}${m[2]}/${m[3]}` : "";
 }
 
@@ -167,6 +182,20 @@ function mostCommon(values) {
   return best;
 }
 
+// 같은 서류가 원문과 영문 번역본으로 같이 오는 경우(일본 등)를 구분하기 위한 언어 추정
+function detectLanguage(text) {
+  const count = (re) => (text.match(re) || []).length;
+  const kana = count(/[\u3040-\u30ff]/g);
+  const hangul = count(/[\uac00-\ud7a3]/g);
+  const han = count(/[\u4e00-\u9fff]/g);
+  const latin = count(/[A-Za-z]/g);
+  if (kana + hangul + han + latin < 20) return "";
+  if (latin > (kana + hangul + han) * 2) return "EN";
+  if (hangul >= kana && hangul >= han * 0.3) return "KO";
+  if (kana > 0) return "JA";
+  return "ZH";
+}
+
 // ---------------------------------------------------------------------------
 // 서류명 / 분류
 
@@ -175,7 +204,8 @@ function parseDocFileName(name) {
   const base = path.basename(name).replace(/\.pdf$/i, "");
   const m = base.match(/^(\d{4})(\d{2})(\d{2})_(.*)$/);
   if (!m) return { date: "", title: base.trim(), version: "" };
-  let title = m[4].replace(/\s+/g, " ").trim();
+  // 같은 날짜에 같은 서류명이 여러 개면 KIPRIS가 "서류명  (2).pdf"처럼 번호를 붙인다
+  let title = m[4].replace(/\s+/g, " ").replace(/\s\(\d+\)$/, "").trim();
   let version = "";
   const v = title.match(/\s(ORIGINAL|TRANSLATION|TRANSLATED|MACHINE TRANSLATION)$/i);
   if (v) {
@@ -185,11 +215,18 @@ function parseDocFileName(name) {
   return { date: `${m[1]}-${m[2]}-${m[3]}`, title, version };
 }
 
-// 등록 키워드가 있으면 "등록", 사건의 최초 일자 서류면 "출원", 나머지는 "중간".
-function classify(doc, firstDate, grantKeywords) {
+function filingDate(docs) {
+  const isFiling = (d) => FILING_KEYWORDS.some((k) => d.title.toLowerCase().includes(k));
+  const dates = docs.filter(isFiling).map((d) => d.date).filter(Boolean);
+  const all = dates.length ? dates : docs.map((d) => d.date).filter(Boolean);
+  return all.length ? all.reduce((a, b) => (a < b ? a : b)) : "";
+}
+
+// 출원일 서류면 "출원", 등록 키워드가 있으면 "등록", 나머지는 "중간".
+function classify(doc, filedOn, grantKeywords) {
+  if (doc.date && doc.date === filedOn) return "출원";
   const t = doc.title.toLowerCase();
   if (grantKeywords.some((k) => t.includes(k))) return "등록";
-  if (doc.date && doc.date === firstDate) return "출원";
   return "중간";
 }
 
@@ -205,32 +242,53 @@ async function readZip(zipPath, cfg) {
   const docs = [];
   const numbers = [];
   const refs = [];
+  const labeledRefs = [];
+  const agentRefs = [];
   let pct = "";
 
   for (const entry of zip.getEntries()) {
     if (entry.isDirectory) continue;
     const name = entryName(entry);
     const data = entry.getData();
-    const doc = { ...parseDocFileName(name), originalName: path.basename(name), data, pages: null };
+    const doc = { ...parseDocFileName(name), originalName: path.basename(name), data, pages: null, lang: "" };
 
     if (/\.pdf$/i.test(name)) {
-      const { text, pages } = await pdfText(data);
-      doc.pages = pages;
+      const extracted = await pdfText(data);
+      const text = normalizeText(extracted.text);
+      doc.pages = extracted.pages;
+      doc.lang = detectLanguage(text);
       numbers.push(...findAppNumbers(text));
       pct = pct || findPct(text);
+      for (const m of text.matchAll(cfg.refLabelPattern)) labeledRefs.push(m[1]);
+      for (const m of text.matchAll(cfg.agentRefLabelPattern)) agentRefs.push(m[1]);
       refs.push(...(text.match(cfg.refPattern) || []));
     }
     docs.push(doc);
   }
 
-  // 가장 많이 나온 국가별 번호를 채택 (서류 여러 개에서 같은 번호가 반복되므로)
-  const best = mostCommon(numbers.map((n) => `${n.country}|${n.appNo}`));
+  // 가장 많이 나온 번호를 채택 (서류 여러 개에서 같은 번호가 반복되므로).
+  // 한국 번호는 해외 사건 서류에 우선권 번호로도 나오므로 다른 국가 번호가 하나도 없을 때만 쓴다.
+  const foreign = numbers.filter((n) => n.country !== "KR");
+  const best = mostCommon((foreign.length ? foreign : numbers).map((n) => `${n.country}|${n.appNo}`));
   const [country, appNo] = best ? best.split("|") : ["", ""];
-  return { docs, country, appNo, pct, ref: mostCommon(refs) };
+  const agentRef = mostCommon(agentRefs);
+  const ref = mostCommon(labeledRefs) || mostCommon(refs.filter((r) => r !== agentRef));
+  return { docs, country, appNo, pct, ref, agentRef };
 }
 
 // ---------------------------------------------------------------------------
 // 메인
+
+// input/ 아래 하위 폴더(국가별, 고객사별 등)에 있는 zip까지 모두 찾는다. 결과는 input/ 기준 상대경로.
+function listZips(dir, rel = "") {
+  const out = [];
+  for (const e of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
+    const r = rel ? path.join(rel, e.name) : e.name;
+    if (e.isDirectory()) out.push(...listZips(dir, r));
+    else if (/\.zip$/i.test(e.name)) out.push(r);
+  }
+  return out;
+}
 
 async function main() {
   const inputDir = path.resolve(process.argv[2] || path.join(ROOT, "input"));
@@ -241,7 +299,7 @@ async function main() {
   }
   const cfg = loadConfig();
   const mapping = loadMapping(inputDir);
-  const zipFiles = fs.readdirSync(inputDir).filter((f) => /\.zip$/i.test(f)).sort();
+  const zipFiles = listZips(inputDir).sort();
   if (zipFiles.length === 0) {
     console.error(`zip 파일이 없습니다: ${inputDir}`);
     process.exit(1);
@@ -264,7 +322,7 @@ async function main() {
       continue;
     }
 
-    const manual = mapping.get(zipFile);
+    const manual = mapping.get(path.basename(zipFile));
     if (manual) {
       info.country = manual.country || info.country;
       info.appNo = manual.appNo || info.appNo;
@@ -274,17 +332,18 @@ async function main() {
     const identified = Boolean(info.country && info.appNo);
     const key = identified
       ? `${info.country}_${info.appNo.replace(/[\/,]/g, "")}`
-      : `${UNIDENTIFIED_DIR}/${zipFile.replace(/\.zip$/i, "")}`;
+      : `${UNIDENTIFIED_DIR}/${path.basename(zipFile).replace(/\.zip$/i, "")}`;
 
     if (!cases.has(key)) {
       cases.set(key, {
         key, identified, country: info.country, appNo: info.appNo,
-        pct: info.pct, ref: info.ref, zips: new Set(), docs: [],
+        pct: info.pct, ref: info.ref, agentRef: info.agentRef, zips: new Set(), docs: [],
       });
     }
     const c = cases.get(key);
     c.pct = c.pct || info.pct;
     c.ref = c.ref || info.ref;
+    c.agentRef = c.agentRef || info.agentRef;
     c.zips.add(zipFile);
 
     // 같은 사건을 나중에 다시 받은 경우 같은 서류는 한 번만 넣는다
@@ -304,11 +363,16 @@ async function main() {
     c.docs.sort((a, b) => (a.date + a.title).localeCompare(b.date + b.title));
     const dates = c.docs.map((d) => d.date).filter(Boolean);
     const firstDate = dates.length ? dates.reduce((a, b) => (a < b ? a : b)) : "";
+    const filedOn = filingDate(c.docs);
+    // 같은 날짜·같은 서류명이 여러 개(원문 + 번역본 등)면 파일명에 언어를 붙여 구분한다
+    const sameName = new Map();
+    for (const d of c.docs) sameName.set(d.date + d.title, (sameName.get(d.date + d.title) || 0) + 1);
 
     const used = new Set();
     for (const doc of c.docs) {
       const ext = path.extname(doc.originalName) || ".pdf";
-      const stem = safeFileName([doc.date, doc.title, doc.version && doc.version !== "ORIGINAL" ? doc.version : ""]
+      const lang = sameName.get(doc.date + doc.title) > 1 ? doc.lang : "";
+      const stem = safeFileName([doc.date, doc.title, doc.version && doc.version !== "ORIGINAL" ? doc.version : "", lang]
         .filter(Boolean).join("_"));
       let fileName = `${stem}${ext}`;
       for (let i = 2; used.has(fileName.toLowerCase()); i++) fileName = `${stem} (${i})${ext}`;
@@ -317,15 +381,15 @@ async function main() {
 
       docRows.push({
         ref: c.ref, country: c.country, appNo: c.appNo, date: doc.date,
-        category: c.identified ? classify(doc, firstDate, cfg.grantKeywords) : "",
-        title: doc.title, version: doc.version, pages: doc.pages,
+        category: c.identified ? classify(doc, filedOn, cfg.grantKeywords) : "",
+        title: doc.title, lang: doc.lang, version: doc.version, pages: doc.pages,
         file: path.posix.join("cases", c.key, fileName), zip: doc.zip,
       });
     }
 
     const last = c.docs[c.docs.length - 1];
     caseRows.push({
-      ref: c.ref, country: c.country, appNo: c.appNo, pct: c.pct,
+      ref: c.ref, agentRef: c.agentRef, country: c.country, appNo: c.appNo, pct: c.pct,
       docCount: c.docs.length, firstDate, lastDate: last ? last.date : "", lastDoc: last ? last.title : "",
       folder: path.posix.join("cases", c.key), zips: [...c.zips].join(", "),
       status: c.identified ? "" : "출원번호 확인 필요 (mapping.csv에 입력 후 재실행)",
@@ -351,6 +415,7 @@ async function writeWorkbook(xlsxPath, caseRows, docRows) {
     { header: "국가", key: "country", width: 6 },
     { header: "출원번호", key: "appNo", width: 18 },
     { header: "PCT번호", key: "pct", width: 20 },
+    { header: "현지대리인번호", key: "agentRef", width: 16 },
     { header: "서류수", key: "docCount", width: 8 },
     { header: "최초서류일", key: "firstDate", width: 12 },
     { header: "최근서류일", key: "lastDate", width: 12 },
@@ -372,6 +437,7 @@ async function writeWorkbook(xlsxPath, caseRows, docRows) {
     { header: "일자", key: "date", width: 12 },
     { header: "서류구분", key: "category", width: 9 },
     { header: "서류명", key: "title", width: 60 },
+    { header: "언어", key: "lang", width: 6 },
     { header: "버전", key: "version", width: 12 },
     { header: "페이지", key: "pages", width: 8 },
     { header: "파일", key: "file", width: 50 },
